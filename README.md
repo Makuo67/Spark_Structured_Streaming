@@ -16,7 +16,7 @@ Key objectives:
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
 │   Data          │     │   Spark          │     │   PostgreSQL     │
-│   Generator     │───▶ │ Structured    n  │───▶│                  │
+│   Generator     │───▶ │ Structured       │───▶│                  │
 │ (generator.py)  │     │ Streaming        │     │ • user_events    │
 └─────────────────┘     │ (main app)       │     │ • user_events_   │
                         └──────────────────┘     │   staging        │
