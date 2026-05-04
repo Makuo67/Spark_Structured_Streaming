@@ -2,62 +2,95 @@
 
 ## Overview
 
-This project implements a fault-tolerant, real-time data pipeline for processing e-commerce user events using Apache Spark Structured Streaming with PostgreSQL as the persistent storage layer. The system simulates continuous event generation, stream ingestion, transformation, and exactly-once delivery to a relational database.
+This project implements a fault-tolerant, real-time data pipeline for processing e-commerce user events using Apache Spark Structured Streaming with PostgreSQL as the serving layer. The system simulates continuous event generation, stream ingestion, transformation, and direct delivery to a relational database.
 
 Key objectives:
 
-- Demonstrate production-grade streaming patterns
-- Ensure data integrity through schema enforcement and idempotent writes
-- Provide end-to-end observability and fault recovery
-- Support scalable micro-batch processing
+- Demonstrate production-grade streaming patterns with Spark Structured Streaming
+- Enforce data integrity through strict schema validation and primary key constraints
+- Provide end-to-end observability and automatic fault recovery via checkpointing
+- Support scalable micro-batch processing with configurable trigger intervals
+
+---
 
 ## Architecture
 
+![System Architecture](system_architecture.png)
+
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   Data          │     │   Spark          │     │   PostgreSQL     │
-│   Generator     │───▶ │ Structured       │───▶│                  │
-│ (generator.py)  │     │ Streaming        │     │ • user_events    │
-└─────────────────┘     │ (main app)       │     │ • user_events_   │
-                        └──────────────────┘     │   staging        │
-                                                 └──────────────────┘
+┌──────────────────┐      ┌────────────────────┐      ┌─────────────────────┐
+│  Event Generator │      │  data/events/       │      │  Spark Structured   │
+│  (generator.py)  │─────▶│  date=.../hour=.../ │─────▶│  Streaming          │
+│                  │      │  events_*.csv        │      │  (main app)         │
+└──────────────────┘      └────────────────────┘      └──────────┬──────────┘
+                                                                  │ JDBC append
+                                                                  ▼
+                                                       ┌─────────────────────┐
+                                                       │  PostgreSQL          │
+                                                       │  • user_events (PK)  │
+                                                       └─────────────────────┘
 ```
 
-### Components
+### Data Flow
 
-1. **Event Generator** (`generator.py`)
-   - Produces synthetic view/purchase events (80/20 ratio)
-   - Batch size: 100 events every 2 seconds
-   - Partitioned Parquet-like output: `data/events/date=YYYY-MM-DD/hour=HH/events_*.csv`
+```
+generator.py  →  data/events/**/*.csv  →  Spark foreachBatch  →  PostgreSQL user_events
+```
 
-2. **Streaming Processor** (`spark_streaming_to_postgres.py`)
-   - File source stream with strict schema and watermarking
-   - Transformations: cleaning, timestamp enrichment
-   - Sink: foreachBatch with JDBC staging + UPSERT merge
-   - Checkpointing for fault tolerance
-   - Trigger interval: 5 seconds
+---
 
-3. **Database Schema** (`postgres_setup.sql`)
-   - `user_events`: Deduplicated events with primary key `event_id`
-   - `user_events_staging`: Atomic batch landing zone
+## Components
+
+### 1. Event Generator (`generator.py`)
+
+- Produces synthetic e-commerce events at a rate of 100 events every 2 seconds
+- Event distribution: 80% `view`, 20% `purchase`
+- Each event carries a UUID `event_id` generated at source
+- Output partitioned by date and hour: `data/events/date=YYYY-MM-DD/hour=HH/events_<ts>.csv`
+
+### 2. Spark Structured Streaming (`spark_streaming_to_postgres.py`)
+
+- **Source**: File-based stream reader monitoring `data/events/` (1 file per trigger)
+- **Schema enforcement**: Strict `StructType` schema — malformed records are rejected at ingestion
+- **Watermarking**: 5-minute tolerance on `event_time` to handle late-arriving data
+- **Transformation**: Null `event_id` filter; `processing_time` column added per micro-batch
+- **Sink**: `foreachBatch` with direct JDBC `append` to `public.user_events`
+- **Trigger interval**: 5 seconds (`processingTime="5 seconds"`)
+- **Fault tolerance**: Offset checkpointing at `checkpoints/events_pipeline/`
+
+### 3. Database (`postgres_setup.sql`)
+
+- Single table `user_events` with `event_id TEXT PRIMARY KEY`
+- UUID primary key provides natural deduplication — duplicate events are rejected at the DB layer
+- No staging table; batch landing and merge happen atomically via JDBC
+
+---
 
 ## Features
 
-- **Exactly-Once Semantics**: Primary key constraints + UPSERT logic
-- **Schema Enforcement**: Strict Spark schema at ingestion
-- **Fault Tolerance**: Checkpointing + connection pooling
-- **Observability**: Structured logging to `logs/` directory
-- **Scalability**: File-based partitioning + configurable batch sizes
+| Feature                | Implementation                                                   |
+| ---------------------- | ---------------------------------------------------------------- |
+| **Idempotent writes**  | UUID `event_id` PRIMARY KEY rejects duplicate records            |
+| **Schema enforcement** | Strict `StructType` at stream ingestion                          |
+| **Fault tolerance**    | Spark offset checkpointing — no batch is skipped on restart      |
+| **Late data handling** | 5-minute watermark on `event_time`                               |
+| **Observability**      | Structured logging per batch with record count and duration      |
+| **Scalability**        | File partitioning + configurable batch size and trigger interval |
+
+---
 
 ## Prerequisites
 
 - Python 3.9+
-- Apache Spark 3.x (with `pyspark`)
+- Apache Spark 3.x with PySpark
 - PostgreSQL 15+
-- Required Python packages:
-  ```
-  pip install pyspark psycopg2-binary pandas
-  ```
+- PostgreSQL JDBC driver (included: `postgresql-42.7.3.jar`)
+
+```bash
+pip install pyspark psycopg2-binary pandas
+```
+
+---
 
 ## Quick Start
 
@@ -73,104 +106,149 @@ docker run -d \
   postgres:15
 ```
 
-### 2. Initialize Database
+### 2. Initialize the Database Schema
 
 ```bash
 docker exec -i ecommerce-postgres psql -U stream_user -d ecommerce_stream < postgres_setup.sql
 ```
 
-### 3. Start Data Generator (Terminal 1)
+### 3. Start the Event Generator (Terminal 1)
 
 ```bash
-cd Spark_Structured_Streaming
 python generator.py
 ```
 
-### 4. Start Streaming Pipeline (Terminal 2)
+### 4. Start the Streaming Pipeline (Terminal 2)
 
 ```bash
-spark-submit spark_streaming_to_postgres.py
+spark-submit \
+  --jars postgresql-42.7.3.jar \
+  spark_streaming_to_postgres.py
 ```
+
+---
 
 ## Configuration
 
-Database parameters are defined in `spark_streaming_to_postgres.py`:
+Connection parameters are defined in `spark_streaming_to_postgres.py`:
 
 ```python
-DB_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'database': 'ecommerce_stream',
-    'user': 'stream_user',
-    'password': 'stream_pass'
+JDBC_URL = "jdbc:postgresql://localhost:5432/ecommerce_stream"
+
+JDBC_PROPERTIES = {
+    "user": "stream_user",
+    "password": "stream_pass",
+    "driver": "org.postgresql.Driver"
 }
 ```
 
-Tune via environment variables or external config as needed.
+Key tuning knobs:
 
-## Event Schema
+| Parameter            | Location       | Default | Effect                         |
+| -------------------- | -------------- | ------- | ------------------------------ |
+| `BATCH_SIZE`         | `generator.py` | `100`   | Events per CSV file            |
+| `SLEEP_INTERVAL`     | `generator.py` | `2s`    | File write cadence             |
+| `maxFilesPerTrigger` | streaming app  | `1`     | Files consumed per micro-batch |
+| `processingTime`     | streaming app  | `5s`    | Micro-batch trigger interval   |
+| Watermark delay      | streaming app  | `5 min` | Late data tolerance            |
 
-| Field             | Type        | Description                   |
-| ----------------- | ----------- | ----------------------------- |
-| `event_id`        | STRING (PK) | Unique event identifier       |
-| `event_time`      | TIMESTAMP   | When event occurred           |
-| `user_id`         | STRING      | `user_N` (N=1..1000)          |
-| `product_id`      | STRING      | `product_N` (N=1..500)        |
-| `event_type`      | STRING      | `view` or `purchase`          |
-| `price`           | DOUBLE      | Purchase amount (0 for views) |
-| `ingestion_time`  | TIMESTAMP   | File write time               |
-| `processing_time` | TIMESTAMP   | Spark processing time         |
+---
+
+## Database Schema
+
+### `user_events`
+
+| Column            | Type            | Constraint      | Description                                       |
+| ----------------- | --------------- | --------------- | ------------------------------------------------- |
+| `event_id`        | `TEXT`          | **PRIMARY KEY** | UUID — unique event identifier, deduplication key |
+| `event_time`      | `TIMESTAMP`     | NOT NULL        | When the event occurred (source time)             |
+| `user_id`         | `VARCHAR(50)`   |                 | `user_N` (N = 1..1000)                            |
+| `product_id`      | `VARCHAR(50)`   |                 | `product_N` (N = 1..500)                          |
+| `event_type`      | `VARCHAR(20)`   |                 | `view` or `purchase`                              |
+| `price`           | `NUMERIC(10,2)` |                 | Purchase amount; `0.00` for views                 |
+| `ingestion_time`  | `TIMESTAMP`     |                 | Timestamp when the CSV file was written           |
+| `processing_time` | `TIMESTAMP`     |                 | Timestamp when Spark processed the record         |
+
+---
 
 ## Monitoring and Logs
 
-- Generator logs: `logs/data_generator.log`
-- Spark logs: `logs/spark_streaming.log`
-- Metrics: `logs/metrics.log`
-- Checkpoints: `checkpoints/events_pipeline/`
+| Log file                   | Content                                                  |
+| -------------------------- | -------------------------------------------------------- |
+| `logs/data_generator.log`  | File write events from generator                         |
+| `logs/spark_streaming.log` | Per-batch SUCCESS/FAILURE with record count and duration |
+| `logs/metrics.log`         | Pipeline metrics                                         |
 
-Tail logs for real-time observability:
+Tail all logs in real time:
 
 ```bash
 tail -f logs/*.log
 ```
 
-## Performance Considerations
+Check stream progress and executor state via the **Spark UI** at [http://localhost:4040](http://localhost:4040).
 
-- **Throughput**: ~1800 events/minute (configurable)
-- **Latency**: End-to-end <10s (micro-batch)
-- **Resource Usage**: Single-node Spark acceptable for demo
-- Scale by increasing Spark executors/partitions
+---
 
-## Testing and Validation
+## Validation Queries
 
-1. Verify data generation: `ls -la data/events/`
-2. Check stream progress: Spark UI (4040)
-3. Query results:
-   ```sql
-   SELECT event_type, COUNT(*) FROM user_events GROUP BY event_type;
-   ```
+```sql
+-- Record count by event type
+SELECT event_type, COUNT(*) AS total
+FROM user_events
+GROUP BY event_type;
+
+-- Latest 10 processed events
+SELECT event_id, event_time, event_type, processing_time
+FROM user_events
+ORDER BY processing_time DESC
+LIMIT 10;
+
+-- End-to-end latency (processing_time - event_time)
+SELECT AVG(EXTRACT(EPOCH FROM (processing_time - event_time))) AS avg_latency_seconds
+FROM user_events;
+```
+
+---
+
+## Performance Characteristics
+
+| Metric             | Value                                           |
+| ------------------ | ----------------------------------------------- |
+| Throughput         | ~3,000 events/min (100 events × 30 batches/min) |
+| End-to-end latency | < 10 seconds (micro-batch)                      |
+| Trigger interval   | 5 seconds                                       |
+| File cadence       | 1 file / 2 seconds                              |
+
+---
 
 ## Directory Structure
 
 ```
 Spark_Structured_Streaming/
-├── generator.py                 # Event producer
-├── spark_streaming_to_postgres.py # Streaming processor
-├── postgres_setup.sql           # Database schema
-├── data/events/                 # Input stream (auto-created)
-├── checkpoints/                 # Fault recovery
-├── logs/                        # Observability
-├── project_overview.md          # Architecture details
-├── user_guide.md                # Deployment guide
-└── README.md                    # This file
+├── generator.py                    # Event producer — writes partitioned CSVs
+├── spark_streaming_to_postgres.py  # Spark Structured Streaming pipeline
+├── postgres_setup.sql              # Database schema (user_events only)
+├── postgresql-42.7.3.jar           # PostgreSQL JDBC driver (required by spark-submit)
+├── system_architecture.png         # Architecture diagram
+├── data/events/                    # Input stream landing zone (auto-created)
+│   └── date=YYYY-MM-DD/
+│       └── hour=HH/
+│           └── events_*.csv
+├── checkpoints/events_pipeline/    # Spark offset checkpoints (fault recovery)
+├── logs/                           # Observability
+│   ├── data_generator.log
+│   ├── spark_streaming.log
+│   └── metrics.log
+├── project_overview.md
+├── user_guide.md
+├── performance_metrics.md
+├── test_cases.md
+└── README.md
 ```
 
-## Next Steps
+---
 
-- Integrate Kafka for true streaming source
-- Add aggregation state stores (windowed metrics)
-- Implement alerting on processing lag
-- Containerize with Docker Compose
+---
 
 ## License
 
